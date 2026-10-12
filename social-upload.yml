@@ -1,0 +1,65 @@
+name: Frame AI - Social upload
+
+# Uploads whatever the web app planned for TODAY (Frame AI/Social/Days/<today>.json).
+# Every 3 hours: an item goes out on the first run after its time slot (slots are chosen by the backend, 10:00-22:00 in the
+# timezone saved in social_config.json). Want finer timing? Add more cron lines. Want it right after the video build? Add
+# this job's steps to frame-ai.yml after "python drive_runner.py".
+on:
+  schedule:
+    - cron: "15 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      ignore_time:
+        description: "Upload today's planned items now (do not wait for their time slot)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Only list what is due, upload nothing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: frame-ai-social
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-social.txt
+
+      - name: System packages (ffmpeg, fonts, bidi)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core libfribidi0
+
+      - run: pip install -r requirements-social.txt
+
+      - name: Upload planned posts
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID || vars.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          IGNORE_TIME: ${{ inputs.ignore_time && '1' || '0' }}
+          MAX_ITEMS: "10"
+          TIME_BUDGET_MIN: "240"
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then python social_runner.py --dry-run; else python social_runner.py; fi
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: social-build
+          path: social_build/**/*.log
+          if-no-files-found: ignore
