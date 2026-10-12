@@ -358,6 +358,12 @@ class Runner:
         b = self.bucket(v["file_id"])
         key = f"{self.reel_key(reel)}|{self.bhash}"
         hit = b["reels"].get(key)
+        if hit and float(hit.get("dur") or (hit["end"] - hit["start"])) > M.REEL_MAX_SEC + 0.5:
+            log.info("cached reel is %.0fs (> %.0fs limit), re-rendering shorter", float(hit.get("dur") or (hit["end"] - hit["start"])), M.REEL_MAX_SEC)
+            self.index.setdefault("trash", []).append(hit["file_id"])
+            for k in [k for k, x in b["reels"].items() if float(x.get("dur") or (x["end"] - x["start"])) > M.REEL_MAX_SEC + 0.5]:
+                b["reels"].pop(k, None)
+            hit = None
         if hit:
             try:
                 return self.fetch(hit["file_id"], "reels"), hit["file_id"], hit
@@ -395,11 +401,12 @@ class Runner:
                 continue
             out = self.work / "reels" / f"{v['file_id']}_{part:02d}.mp4"
             out.parent.mkdir(parents=True, exist_ok=True)
-            log.info("rendering reel %d/%d (%.0fs-%.0fs) of %s", part, of, a, z, v.get("title"))
+            a, z, speed = M.fit_reel(a, z, cands)          # Facebook Reels max 90 s
+            log.info("rendering reel %d/%d (%.0fs-%.0fs, speed x%.3f) of %s", part, of, a, z, speed, v.get("title"))
             M.render_reel(src, out, a, z, reel.get("fit", "blur"), part, r["of"], bool(reel.get("part_label")),
-                          self.backend, logo)
+                          self.backend, logo, speed=speed)
             fid = self.drive.upload_file(out, f"part-{part:02d}_{self.bhash}.mp4", folder)
-            b["reels"][pkey] = {"file_id": fid, "start": a, "end": z, "hook": hook}
+            b["reels"][pkey] = {"file_id": fid, "start": a, "end": z, "hook": hook, "dur": (z - a) / speed}
             self.local[fid] = str(out)
             self.save_index()
         hit = b["reels"][key]
@@ -483,14 +490,7 @@ class Runner:
                 text = f"{hook}\n\n{text}"
             if ai.get("hashtags") and hashtags and "#" not in text:
                 text = f"{text}\n\n{' '.join(meta['hashtags'][:5 if pf == 'tiktok' else 8])}"
-            thumb_url = None
-            if kind == "video" and pf == "facebook":
-                thumb_path = build_thumbnail(item.get("thumbnail"), self.drive, self.work / "thumb", self.brand.get("identity", {}).get("primary", "#4560e6"))
-                if thumb_path:
-                    tid = self.drive.upload_file(thumb_path, f"thumb_{item['id']}.jpg", self.drive.ensure_folder("Thumbs", self.cache_dir), "image/jpeg")
-                    thumb_url = self.public_url(tid)
-                    self.index.setdefault("trash", []).append(tid)
-            post_id = buffer_post(acct["api_key"], channel, pf, kind, text, self.public_url(pub_id), thumb_url)
+            post_id = buffer_post(acct["api_key"], channel, pf, kind, text, self.public_url(pub_id))
             extra["buffer_id"] = post_id
             self.needs_clear.update({f"buffer-{pf}-key", f"buffer-{pf}-channel"})
         return link, units, extra

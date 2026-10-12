@@ -171,16 +171,16 @@ def _buffer_meta(platform, kind):
 
 
 def buffer_post(api_key, channel_id, platform, kind, text, video_url, thumb_url=None):
-    """Publishes now. Returns the Buffer post id. The media url must stay public until Buffer has fetched it."""
-    video = {"url": video_url}
-    if thumb_url:
-        video["thumbnailUrl"] = thumb_url
+    """Publishes now. Returns the Buffer post id. The media url must stay public until Buffer has fetched it.
+
+    thumb_url is accepted for backward compatibility but NOT sent: Buffer rejects video.thumbnailUrl
+    ("social networks do not accept custom video thumbnail images")."""
     base = {"text": text or "", "channelId": channel_id, "schedulingType": "automatic", "mode": "shareNow",
-            "assets": [{"video": video}]}
+            "assets": [{"video": {"url": video_url}}]}
     meta = _buffer_meta(platform, kind)
     tries = [dict(base, metadata=meta)] if meta else []
     tries.append(base)                       # if Buffer rejects the metadata shape, post without it
-    last = ""
+    last, first = "", ""
     for inp in tries:
         try:
             r = requests.post(BUFFER, json={"query": CREATE, "variables": {"input": inp}}, timeout=90,
@@ -195,16 +195,18 @@ def buffer_post(api_key, channel_id, platform, kind, text, video_url, thumb_url=
         errs = j.get("errors") or []
         if errs:
             last = errs[0].get("message", str(errs[0]))
-            if "metadata" in last.lower() or "enum" in last.lower() or "variable" in last.lower():
+            first = first or last
+            if inp is not tries[-1] and any(k in last.lower() for k in ("metadata", "enum", "variable")):
                 continue                        # try again without metadata
-            raise RuntimeError(f"Buffer: {last[:300]}")
+            raise RuntimeError(f"Buffer: {first[:300]}")   # first error = the real reason (the retry's error is only noise)
         res = (j.get("data") or {}).get("createPost") or {}
         if res.get("post"):
             return res["post"]["id"]
         last = res.get("message") or str(j)[:300]
+        first = first or last
         if "limit" in last.lower() or "quota" in last.lower():
             raise Quota(f"Buffer: {last[:200]}")
-        if "metadata" in last.lower() and inp is tries[0] and len(tries) > 1:
+        if inp is not tries[-1] and "metadata" in last.lower():
             continue
-        raise RuntimeError(f"Buffer: {last[:300]}")
-    raise RuntimeError(f"Buffer: {last[:300]}")
+        raise RuntimeError(f"Buffer: {first[:300]}")
+    raise RuntimeError(f"Buffer: {first[:300] or last[:300]}")

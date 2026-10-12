@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -182,6 +183,22 @@ def plan_cuts(dur, count, mode, cands, ranges=None):
     return [(edges[i], edges[i + 1]) for i in range(count) if edges[i + 1] - edges[i] > 1.0]
 
 
+REEL_MAX_SEC = float(os.environ.get("REEL_MAX_SEC", 89))   # Facebook Reels: 90 s max, so every shared reel stays under it
+
+
+def fit_reel(a, z, cands, max_sec=None):
+    """-> (start, end, speed). Keeps a reel under max_sec.
+    Slightly too long (<= 6 %): play it a bit faster (speech stays natural). Much too long: end it at the last safe pause."""
+    max_sec = max_sec or REEL_MAX_SEC
+    dur = z - a
+    if dur <= max_sec:
+        return a, z, 1.0
+    if dur <= max_sec * 1.06:
+        return a, z, dur / max_sec
+    near = [c for c in cands if a + max_sec * 0.7 <= c <= a + max_sec]
+    return a, (max(near) if near else a + max_sec), 1.0
+
+
 # --------------------------------------------------------------------------- watermark
 def _wm_filter(wm, label_in, label_wm, label_out, base_w, dur):
     """Overlay chain for one placement dict from brand.json."""
@@ -270,9 +287,10 @@ def _font():
     return next((f for f in FONTS if Path(f).exists()), None)
 
 
-def render_reel(src, out, start, end, fit, part, parts, part_label, backend, logo_path, W=1080, H=1920, fps=30):
+def render_reel(src, out, start, end, fit, part, parts, part_label, backend, logo_path, W=1080, H=1920, fps=30, speed=1.0):
     wm = backend.get("reel") or {}
     dur = end - start
+    speed = max(1.0, min(float(speed or 1.0), 1.1))
     if fit == "crop":
         base = f"[0:v]scale=-2:{H},crop={W}:{H},setsar=1[b0]"
     elif fit == "pad":
@@ -281,6 +299,10 @@ def render_reel(src, out, start, end, fit, part, parts, part_label, backend, log
         base = (f"[0:v]split=2[a][b];[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
                 f"boxblur=28:6[bg];[b]scale={W}:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[b0]")
     chains, last, inputs = [base], "b0", ["-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(src)]
+    if speed > 1.001:
+        chains.append(f"[{last}]setpts=PTS/{speed:.5f}[bs]")
+        last = "bs"
+        dur = dur / speed
     font = _font()
     if part_label and parts > 1 and font:
         chains.append(f"[{last}]drawtext=fontfile={font}:text='Part {part}/{parts}':fontsize=54:fontcolor=white:"
@@ -291,7 +313,7 @@ def render_reel(src, out, start, end, fit, part, parts, part_label, backend, log
         chains.append(_wm_filter(wm, last, "1:v", "b2", W, dur))
         last = "b2"
     ff(*inputs, "-filter_complex", ";".join(chains), "-map", f"[{last}]", "-map", "0:a?", "-r", fps, *ENC,
-       "-af", "aresample=48000", out, what=f"reel {part}")
+       "-af", (f"atempo={speed:.5f}," if speed > 1.001 else "") + "aresample=48000", out, what=f"reel {part}")
     return Path(out)
 
 
