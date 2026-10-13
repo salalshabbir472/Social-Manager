@@ -42,7 +42,7 @@ from social_thumb import build_thumbnail
 log = logging.getLogger("social")
 SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
-YT_COST = {"upload": 1600, "thumb": 50, "caption": 400}
+YT_COST = {"upload": 1600, "thumb": 50, "caption": 400, "playlist_item": 50, "playlist_create": 50, "playlist_find": 1}
 PUBLIC_HOURS = 3          # a Drive file stays public this long after a Buffer post (Buffer must fetch it)
 
 DEFAULTS = {
@@ -82,7 +82,7 @@ class Runner:
         self.work.mkdir(parents=True, exist_ok=True)
         self.done, self.touched, self.blocked, self.needs_add, self.needs_clear = [], set(), set(), {}, set()
         self.local = {}           # drive file id -> local path (this run only)
-        self.sheet_ids = {}
+        self.sheet_ids, self.project_names = {}, {}
         self.gem = None
 
     # ------------------------------------------------------------------ workspace
@@ -433,6 +433,69 @@ class Runner:
         self.index["public"][fid] = max(self.index["public"].get(fid) or 0, until or 0, time.time())
         return url
 
+    # ------------------------------------------------------------------ playlists (YouTube only)
+    def project_name(self, v):
+        """Name of the project (= playlist) a video belongs to, from the Projects registry. Singles have none."""
+        key = v.get("project_id")
+        if v.get("single") or not key or not self.app:
+            return None
+        if key not in self.project_names:
+            name = None
+            try:
+                ps = self.drive.find("Projects", self.app, SHEET_MIME)
+                for r in (self.drive.sheet_read(ps["id"], "Projects!A2:G") if ps else []):
+                    if len(r) > 1 and r[1] == key:
+                        name = (r[0] or "").strip() or None
+            except Exception as e:  # noqa: BLE001
+                log.info("project name lookup failed: %s", e)
+            self.project_names[key] = name
+        return self.project_names[key]
+
+    def playlist_name(self, item):
+        """Playlist title for this item, or None. The web app writes it on every item (socialPlan.js, snapshotVideo/makeItem):
+        item.video.project = the project's name (a Project IS a playlist), item.video.single = true for a stand-alone video
+        from Singles (no playlist). Fallback for a missing name: the Projects registry, looked up by project_id."""
+        v = item.get("video") or {}
+        if v.get("single"):
+            return None
+        name = str(v.get("project") or "").strip()
+        return name or self.project_name(v)
+
+    def youtube_playlist(self, item, video_id, privacy, language):
+        """Put the uploaded video into its playlist (created on the channel when missing). Never raises: the video is already
+        up, a failure here must not make the runner upload it again. Returns (units, playlist name or None)."""
+        name = self.playlist_name(item)
+        if not name or (item["kind"] == "reel" and not self.cfg["limits"].get("playlist_for_reels", False)):
+            return 0, None
+        units, cache = 0, self.index.setdefault("playlists", {})
+        try:
+            for attempt in (1, 2):
+                pid = cache.get(name.lower())
+                if not pid:
+                    pid = self.yt.find_playlist(name)
+                    units += YT_COST["playlist_find"]
+                    if not pid:
+                        pid = self.yt.create_playlist(name, "", privacy, language)
+                        units += YT_COST["playlist_create"]
+                        log.info("   created YouTube playlist '%s'", name)
+                    cache[name.lower()] = pid
+                ok = self.yt.add_to_playlist(pid, video_id)
+                units += YT_COST["playlist_item"]
+                if ok is True:
+                    log.info("   added to YouTube playlist '%s'", name)
+                    self.needs_clear.add("yt-playlist")
+                    return units, name
+                cache.pop(name.lower(), None)      # playlist was deleted on YouTube -> look it up / create it again once
+            return units, None
+        except NeedsUser:
+            raise
+        except Exception as e:  # noqa: BLE001
+            low = str(e).lower()
+            if "insufficient" in low or "scope" in low:
+                self.needs_add["yt-playlist"] = ("youtube", "YouTube playlists could not be created. Connect YouTube again once so it can manage playlists.")
+            log.warning("playlist '%s' not set for video %s: %s", name, video_id, str(e)[:200])
+            return units, None
+
     def buffer_target(self, pf, item):
         """(account dict with api_key, channel id) for a Buffer platform. Each platform can have its own Buffer account/API key
         (accounts.buffer.<platform>.api_key) or share accounts.buffer.api_key; (None, None) if not configured."""
@@ -515,6 +578,10 @@ class Runner:
             units = YT_COST["upload"]
             extra["video_id"] = vid
             self.needs_clear.add("yt-token")
+            pl_units, pl_name = self.youtube_playlist(item, vid, pub.get("privacy"), lang_code(v.get("language")))
+            units += pl_units
+            if pl_name:
+                extra["playlist"] = pl_name
             if kind == "video":
                 thumb_path = build_thumbnail(item.get("thumbnail"), self.drive, self.work / "thumb", self.brand.get("identity", {}).get("primary", "#4560e6"))
                 if thumb_path and self.yt.set_thumbnail(vid, thumb_path):
