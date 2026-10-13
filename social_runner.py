@@ -27,7 +27,7 @@ import re
 import shutil
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -50,7 +50,8 @@ DEFAULTS = {
     "accounts": {"youtube": {"refresh_token": ""}, "buffer": {"api_key": "", "organization_id": ""}},
     "platforms": {},
     "ai": {"tags": True, "hashtags": True, "hook": False, "reel_planning": True, "transcribe": True},
-    "limits": {"youtube_units": 10000, "attempts": 3, "window_start": "10:00", "window_end": "22:00"},
+    "limits": {"youtube_units": 10000, "attempts": 3, "window_start": "10:00", "window_end": "22:00",
+               "buffer_mode": "schedule"},   # schedule = hand Buffer today's posts at once with dueAt; "now" = old behaviour
 }
 
 
@@ -425,10 +426,60 @@ class Runner:
         return b["meta"][k]
 
     # ------------------------------------------------------------------ one item
-    def public_url(self, fid):
+    def public_url(self, fid, until=None):
+        """Make a Drive file public. It is revoked PUBLIC_HOURS after `until` (epoch; default now) - for scheduled Buffer posts
+        that is the publish time, so Buffer can still fetch the file when it publishes."""
         url = self.drive.make_public(fid)
-        self.index["public"][fid] = time.time()
+        self.index["public"][fid] = max(self.index["public"].get(fid) or 0, until or 0, time.time())
         return url
+
+    def buffer_target(self, pf, item):
+        """(account dict with api_key, channel id) for a Buffer platform. Each platform can have its own Buffer account/API key
+        (accounts.buffer.<platform>.api_key) or share accounts.buffer.api_key; (None, None) if not configured."""
+        acct = self.cfg["accounts"]["buffer"]
+        acct = acct.get(pf) if (acct.get(pf) or {}).get("api_key") else acct
+        channel = (item.get("publish") or {}).get("channel_id") or (self.cfg["platforms"].get(pf) or {}).get("channel_id")
+        return (acct if (acct or {}).get("api_key") else None), channel
+
+    def buffer_full(self, item):
+        """True when this channel already holds as many scheduled-but-not-yet-published posts as Buffer allows (free plan: 10 per
+        channel, counted per channel - other channels / other Buffer accounts have their own room). limits.buffer_max_scheduled, 0 = no cap."""
+        cap = int(self.cfg["limits"].get("buffer_max_scheduled", 10))
+        acct, channel = self.buffer_target(item["platform"], item)
+        if cap <= 0 or not acct or not channel:
+            return False
+        now, n = time.time(), 0
+        for d in self.days.values():
+            for i in d["data"].get("items", []):
+                sf = (i.get("result") or {}).get("scheduled_for")
+                if i["platform"] == "youtube" or i.get("status") != "Uploaded" or not sf:
+                    continue
+                a2, c2 = self.buffer_target(i["platform"], i)
+                if a2 and c2 == channel and a2["api_key"] == acct["api_key"] and \
+                        datetime.strptime(sf, "%Y-%m-%dT%H:%M:%S.000Z").replace(tzinfo=timezone.utc).timestamp() > now:
+                    n += 1
+        return n >= cap
+
+    def block_for(self, pf, e):
+        """Quota: scope 'key' (Buffer rate limit) blocks every platform sharing that API key; otherwise just this platform."""
+        if getattr(e, "scope", "channel") == "key" and pf != "youtube":
+            acct, _ = self.buffer_target(pf, {})
+            same = {p for p in ("facebook", "instagram", "tiktok") if (self.buffer_target(p, {})[0] or {}).get("api_key") == (acct or {}).get("api_key")}
+            self.blocked.update(same | {pf})
+        else:
+            self.blocked.add(pf)
+
+    def buffer_slot(self, date, item):
+        """(epoch, UTC iso string) of the item's slot if it is still in the future (Buffer schedule mode), else (None, None)."""
+        if self.cfg["limits"].get("buffer_mode", "schedule") != "schedule" or self.args.ignore_time:
+            return None, None
+        t = item.get("time")
+        if not t or t == "auto":
+            return None, None
+        dt = datetime.strptime(f"{date} {t}", "%Y-%m-%d %H:%M").replace(tzinfo=self.tz)
+        if dt.timestamp() < time.time() + 300:          # slot is now/past -> publish right away
+            return None, None
+        return dt.timestamp(), dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     def process(self, date, item):
         pf, kind, v = item["platform"], item["kind"], item["video"]
@@ -478,11 +529,9 @@ class Runner:
                     if not ok:
                         self.needs_add["yt-captions"] = ("youtube", "Subtitles could not be added to YouTube. Connect YouTube again once so it can add subtitles.")
         else:
-            acct = self.cfg["accounts"]["buffer"]
-            acct = acct.get(pf) if (acct.get(pf) or {}).get("api_key") else acct
-            if not (acct or {}).get("api_key"):
+            acct, channel = self.buffer_target(pf, item)
+            if not acct:
                 raise NeedsUser(f"buffer-{pf}-key", pf, f"No Buffer API key for {pf}. Add it in Social > Accounts.")
-            channel = (item.get("publish") or {}).get("channel_id") or (self.cfg["platforms"].get(pf) or {}).get("channel_id")
             if not channel:
                 raise NeedsUser(f"buffer-{pf}-channel", pf, f"No Buffer channel chosen for {pf}. Pick it in Social > Accounts.")
             text = item.get("caption") or v.get("title", "")
@@ -490,8 +539,12 @@ class Runner:
                 text = f"{hook}\n\n{text}"
             if ai.get("hashtags") and hashtags and "#" not in text:
                 text = f"{text}\n\n{' '.join(meta['hashtags'][:5 if pf == 'tiktok' else 8])}"
-            post_id = buffer_post(acct["api_key"], channel, pf, kind, text, self.public_url(pub_id))
+            slot_ts, due_at = self.buffer_slot(date, item)
+            post_id = buffer_post(acct["api_key"], channel, pf, kind, text, self.public_url(pub_id, slot_ts), due_at=due_at)
             extra["buffer_id"] = post_id
+            if due_at:
+                extra["scheduled_for"] = due_at
+                log.info("   scheduled on Buffer for %s (%s)", item.get("time"), due_at)
             self.needs_clear.update({f"buffer-{pf}-key", f"buffer-{pf}-channel"})
         return link, units, extra
 
@@ -572,8 +625,10 @@ class Runner:
                     self.edit_item(self.today, it["id"], lambda x: x.update(status="Planned"))
         self.assign_times(self.today)
         hhmm = self.now().strftime("%H:%M")
+        sched = self.cfg["limits"].get("buffer_mode", "schedule") == "schedule"   # Buffer posts are handed over now, Buffer publishes at the slot
         due = [i for i in self.days[self.today]["data"]["items"] if i.get("status") == "Planned"
-               and (self.args.ignore_time or (i.get("time") in (None, "", "auto") or i["time"] <= hhmm))]
+               and (self.args.ignore_time or (i.get("time") in (None, "", "auto") or i["time"] <= hhmm)
+                    or (sched and i["platform"] != "youtube"))]
         due.sort(key=lambda i: (i.get("time") or "", i.get("order", 0)))
         log.info("%s %s: %d due now (%d planned today)", self.today, hhmm, len(due),
                  sum(1 for i in self.days[self.today]["data"]["items"] if i.get("status") == "Planned"))
@@ -589,6 +644,9 @@ class Runner:
             pf = item["platform"]
             if pf in self.blocked:
                 continue
+            if pf != "youtube" and self.buffer_slot(self.today, item)[0] and self.buffer_full(item):
+                log.info("%s channel is full on Buffer (scheduled-post cap), %s waits for a later run", pf, item["video"]["title"])
+                continue
             n = int((item.get("result") or {}).get("attempts") or 0)
             self.edit_item(self.today, item["id"], lambda x: (x.update(status="Uploading"), x["result"].update(started=time.time())))
             stamp = lambda: self.now().strftime("%Y-%m-%d %H:%M:%S")   # noqa: E731
@@ -602,7 +660,7 @@ class Runner:
                 self.save_index()
             except Quota as e:
                 msg = f"Waiting: {e}"
-                self.blocked.add(pf)
+                self.block_for(pf, e)
                 self.edit_item(self.today, item["id"], lambda x: (x.update(status="Planned"), x["result"].update(error=msg)))
                 log.warning("%s blocked for this run: %s", pf, e)
             except NeedsUser as e:
