@@ -21,7 +21,12 @@ log = logging.getLogger("social")
 
 
 class Quota(Exception):
-    """Platform says: no more uploads today / for now."""
+    """Platform says: no more uploads today / for now.
+    scope: "channel" = this channel/platform only (e.g. Buffer scheduled-post cap per channel),
+           "key" = everything that uses the same API key (e.g. Buffer request rate limit, which is per API key)."""
+    def __init__(self, message="", scope="channel"):
+        super().__init__(message)
+        self.scope = scope
 
 
 class NeedsUser(Exception):
@@ -170,29 +175,45 @@ def _buffer_meta(platform, kind):
     return None
 
 
-def buffer_post(api_key, channel_id, platform, kind, text, video_url, thumb_url=None):
-    """Publishes now. Returns the Buffer post id. The media url must stay public until Buffer has fetched it.
-
-    thumb_url is accepted for backward compatibility but NOT sent: Buffer rejects video.thumbnailUrl
-    ("social networks do not accept custom video thumbnail images")."""
-    base = {"text": text or "", "channelId": channel_id, "schedulingType": "automatic", "mode": "shareNow",
-            "assets": [{"video": {"url": video_url}}]}
-    meta = _buffer_meta(platform, kind)
-    tries = [dict(base, metadata=meta)] if meta else []
-    tries.append(base)                       # if Buffer rejects the metadata shape, post without it
-    last, first = "", ""
-    for inp in tries:
+def _buffer_request(api_key, inp):
+    """One createPost request. A 429 with a short Retry-After is waited out once (limits are per API key)."""
+    for attempt in (1, 2):
         try:
             r = requests.post(BUFFER, json={"query": CREATE, "variables": {"input": inp}}, timeout=90,
                               headers={"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"})
         except requests.RequestException as e:
             raise RuntimeError(f"Buffer not reachable: {e}") from e
+        wait = int(r.headers.get("Retry-After") or 0) if r.status_code == 429 else 0
+        if attempt == 1 and 0 < wait <= 90:
+            time.sleep(wait + 1)
+            continue
+        return r
+
+
+def buffer_post(api_key, channel_id, platform, kind, text, video_url, thumb_url=None, due_at=None):
+    """due_at (UTC ISO string, e.g. 2026-10-13T16:30:00.000Z) -> Buffer schedules the post for that time (customScheduled);
+    without it the post is published now (shareNow). Returns the Buffer post id. The media url must stay public until Buffer has fetched it.
+
+    thumb_url is accepted for backward compatibility but NOT sent: Buffer rejects video.thumbnailUrl
+    ("social networks do not accept custom video thumbnail images")."""
+    base = {"text": text or "", "channelId": channel_id, "schedulingType": "automatic", "mode": "shareNow",
+            "assets": [{"video": {"url": video_url}}]}
+    if due_at:
+        base.update(mode="customScheduled", dueAt=due_at)
+    meta = _buffer_meta(platform, kind)
+    tries = [dict(base, metadata=meta)] if meta else []
+    tries.append(base)                       # if Buffer rejects the metadata shape, post without it
+    last, first = "", ""
+    for inp in tries:
+        r = _buffer_request(api_key, inp)
         if r.status_code in (401, 403):
             raise NeedsUser(f"buffer-{platform}-key", platform, f"Buffer refused the {platform} API key. Paste a new one in Social > Accounts.")
         if r.status_code == 429:
-            raise Quota("Buffer rate limit")
+            raise Quota("Buffer API rate limit for this API key (resets automatically)", scope="key")
         j = r.json() if r.content else {}
         errs = j.get("errors") or []
+        if any((e.get("extensions") or {}).get("code") == "RATE_LIMIT_EXCEEDED" for e in errs):
+            raise Quota("Buffer API rate limit for this API key (resets automatically)", scope="key")
         if errs:
             last = errs[0].get("message", str(errs[0]))
             first = first or last
