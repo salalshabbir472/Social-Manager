@@ -1,22 +1,14 @@
 name: Frame AI - Social upload
 
 # Uploads whatever the web app planned for TODAY (Frame AI/Social/Days/<today>.json).
-# Every 3 hours: an item goes out on the first run after its time slot (slots are chosen by the backend, 10:00-22:00 in the
-# timezone saved in social_config.json). Want finer timing? Add more cron lines. Want it right after the video build? Add
-# this job's steps to frame-ai.yml after "python drive_runner.py".
+# Runs every 2 hours (cron is UTC). An item goes out on the first run after its time slot (slots are chosen by the backend,
+# 10:00-22:00 in the timezone saved in social_config.json).
+# NOTE: a run must finish BEFORE the next one starts (TIME_BUDGET_MIN < cron gap), otherwise GitHub queues only one waiting
+# run and silently drops the rest -> it looks like "runs only once a day".
 on:
   schedule:
-    - cron: "15 */3 * * *"
+    - cron: "17 */2 * * *"
   workflow_dispatch:
-    inputs:
-      ignore_time:
-        description: "Upload today's planned items now (do not wait for their time slot)"
-        type: boolean
-        default: false
-      dry_run:
-        description: "Only list what is due, upload nothing"
-        type: boolean
-        default: false
 
 concurrency:
   group: frame-ai-social
@@ -28,7 +20,7 @@ permissions:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
 
@@ -50,11 +42,9 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID || vars.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          IGNORE_TIME: ${{ inputs.ignore_time && '1' || '0' }}
           MAX_ITEMS: "10"
-          TIME_BUDGET_MIN: "240"
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then python social_runner.py --dry-run; else python social_runner.py; fi
+          TIME_BUDGET_MIN: "90"
+        run: python social_runner.py
 
       - name: Upload logs on failure
         if: failure()
