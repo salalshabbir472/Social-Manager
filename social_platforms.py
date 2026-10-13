@@ -138,6 +138,45 @@ class YouTube:
             return False
         return True
 
+    # ---- playlists (needs scope youtube / youtube.force-ssl, which the web app already asks for) ----
+    def find_playlist(self, title):
+        """Id of the channel's own playlist with exactly this title (case-insensitive), or None. 1 quota unit per page."""
+        want, token = title.strip().lower(), None
+        while True:
+            params = {"part": "snippet", "mine": "true", "maxResults": 50}
+            if token:
+                params["pageToken"] = token
+            r = requests.get(f"{YT}/playlists", params=params, headers=self._h(), timeout=60)
+            if r.status_code != 200:
+                self._raise(r)
+            j = r.json()
+            for it in j.get("items", []):
+                if (it["snippet"].get("title") or "").strip().lower() == want:
+                    return it["id"]
+            token = j.get("nextPageToken")
+            if not token:
+                return None
+
+    def create_playlist(self, title, description="", privacy="public", language=None):
+        snippet = {"title": _clean(title, 150), "description": _clean(description, 4900)}
+        if language:
+            snippet["defaultLanguage"] = language
+        r = requests.post(f"{YT}/playlists", params={"part": "snippet,status"}, headers=self._h(), timeout=60,
+                          json={"snippet": snippet, "status": {"privacyStatus": privacy or "public"}})
+        if r.status_code != 200:
+            self._raise(r)
+        return r.json()["id"]
+
+    def add_to_playlist(self, playlist_id, video_id):
+        """Returns True, 'gone' when the playlist no longer exists, or raises."""
+        r = requests.post(f"{YT}/playlistItems", params={"part": "snippet"}, headers=self._h(), timeout=60,
+                          json={"snippet": {"playlistId": playlist_id, "resourceId": {"kind": "youtube#video", "videoId": video_id}}})
+        if r.status_code == 200:
+            return True
+        if r.status_code == 404 and "playlistnotfound" in r.text.lower():
+            return "gone"
+        self._raise(r)
+
     def add_captions(self, video_id, srt_text, language, name="Subtitles"):
         """Needs scope youtube.force-ssl. Returns True, or False when the saved login lacks that scope."""
         meta = {"snippet": {"videoId": video_id, "language": language or "en", "name": name, "isDraft": False}}
