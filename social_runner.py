@@ -572,9 +572,13 @@ class Runner:
             if ai.get("hashtags") and hashtags and "#" not in re.sub(r"#shorts", "", desc, flags=re.I):
                 desc = f"{desc}\n\n{' '.join(meta['hashtags'][:5])}".strip()
             tags = pub.get("tags") or (meta.get("tags") if ai.get("tags") else []) or []
+            _, yt_due_at = self.buffer_slot(date, item)      # future slot -> upload now as private, YouTube publishes at the slot
             vid, link = self.yt.upload_video(path, item.get("title") or v.get("title"), desc, tags, pub.get("category"),
                                              pub.get("privacy"), pub.get("made_for_kids"), lang_code(v.get("language")),
-                                             is_short=(kind == "reel"))
+                                             is_short=(kind == "reel"), publish_at=yt_due_at)
+            if yt_due_at:
+                extra["scheduled_for"] = yt_due_at
+                log.info("   scheduled on YouTube for %s (%s)", item.get("time"), yt_due_at)
             units = YT_COST["upload"]
             extra["video_id"] = vid
             self.needs_clear.add("yt-token")
@@ -616,9 +620,24 @@ class Runner:
         return link, units, extra
 
     def yt_units_today(self):
-        today = self.today
+        """Units used since the last YouTube quota reset (midnight Pacific time, NOT midnight local time)."""
+        start = (datetime.now(ZoneInfo("America/Los_Angeles")).replace(hour=0, minute=0, second=0, microsecond=0)
+                 .astimezone(self.tz).strftime("%Y-%m-%d %H:%M:%S"))
         return sum(int((i.get("result") or {}).get("units") or 0) for d in self.days.values() for i in d["data"].get("items", [])
-                   if i.get("platform") == "youtube" and i.get("status") == "Uploaded" and str((i.get("result") or {}).get("at", "")).startswith(today))
+                   if i.get("platform") == "youtube" and i.get("status") == "Uploaded"
+                   and str((i.get("result") or {}).get("at", "")) >= start)
+
+    def yt_need(self, item):
+        """Units this item will cost on YouTube (upload + playlist, + thumbnail and subtitles for a complete video)."""
+        n = YT_COST["upload"] + YT_COST["playlist_find"] + YT_COST["playlist_create"] + YT_COST["playlist_item"]
+        if item["kind"] == "video":
+            n += YT_COST["thumb"]
+            if self.srt_for(item["video"]):
+                n += YT_COST["caption"]
+        return n
+
+    def yt_room(self, item):
+        return self.yt_units_today() + self.yt_need(item) <= int(self.cfg["limits"]["youtube_units"])
 
     # ------------------------------------------------------------------ housekeeping
     def need_requests(self):
@@ -688,14 +707,14 @@ class Runner:
         for it in list(self.days[self.today]["data"]["items"]):
             if it.get("status") == "Uploading":
                 started = (it.get("result") or {}).get("started", 0)
-                if time.time() - float(started or 0) > 3 * 3600 and not self.args.dry_run:
+                if time.time() - float(started or 0) > 2 * 3600 and not self.args.dry_run:
                     self.edit_item(self.today, it["id"], lambda x: x.update(status="Planned"))
         self.assign_times(self.today)
         hhmm = self.now().strftime("%H:%M")
         sched = self.cfg["limits"].get("buffer_mode", "schedule") == "schedule"   # Buffer posts are handed over now, Buffer publishes at the slot
         due = [i for i in self.days[self.today]["data"]["items"] if i.get("status") == "Planned"
                and (self.args.ignore_time or (i.get("time") in (None, "", "auto") or i["time"] <= hhmm)
-                    or (sched and i["platform"] != "youtube"))]
+                    or sched)]
         due.sort(key=lambda i: (i.get("time") or "", i.get("order", 0)))
         log.info("%s %s: %d due now (%d planned today)", self.today, hhmm, len(due),
                  sum(1 for i in self.days[self.today]["data"]["items"] if i.get("status") == "Planned"))
@@ -710,6 +729,13 @@ class Runner:
                 break
             pf = item["platform"]
             if pf in self.blocked:
+                continue
+            if pf == "youtube" and not self.yt_room(item):
+                self.blocked.add("youtube")
+                used = self.yt_units_today()
+                log.info("YouTube quota used %d / %s units: no more YouTube uploads in this run (waits for the quota reset)",
+                         used, self.cfg["limits"]["youtube_units"])
+                self.edit_item(self.today, item["id"], lambda x: x["result"].update(error="Waiting: YouTube quota is used up, uploads again after the reset."))
                 continue
             if pf != "youtube" and self.buffer_slot(self.today, item)[0] and self.buffer_full(item):
                 log.info("%s channel is full on Buffer (scheduled-post cap), %s waits for a later run", pf, item["video"]["title"])

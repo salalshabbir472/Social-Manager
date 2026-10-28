@@ -80,7 +80,7 @@ class YouTube:
             raise Quota(f"YouTube quota: {r.text[:160]}")
         raise RuntimeError(f"YouTube {r.status_code}: {r.text[:300]}")
 
-    def upload_video(self, path, title, description, tags, category, privacy, made_for_kids, language, is_short):
+    def upload_video(self, path, title, description, tags, category, privacy, made_for_kids, language, is_short, publish_at=None):
         desc = _clean(description, 4900)
         if is_short and "#shorts" not in desc.lower() and "#shorts" not in title.lower():
             desc = (desc + "\n\n#Shorts").strip()
@@ -91,6 +91,10 @@ class YouTube:
             snippet["defaultAudioLanguage"] = language
         body = {"snippet": snippet, "status": {"privacyStatus": privacy or "public", "selfDeclaredMadeForKids": bool(made_for_kids),
                                                 "embeddable": True, "license": "youtube"}}
+        if publish_at and (privacy in (None, "", "public")):
+            # scheduled publishing: uploaded as private now, YouTube makes it public by itself at publish_at (UTC ISO string)
+            body["status"]["privacyStatus"] = "private"
+            body["status"]["publishAt"] = publish_at
         path = Path(path)
         size = path.stat().st_size
         r = requests.post(f"{YT_UP}/videos", params={"uploadType": "resumable", "part": "snippet,status"},
